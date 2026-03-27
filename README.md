@@ -1,26 +1,44 @@
 # Nisaetus
 
+<p align="center">
+  <img src="assets/glass.png" width="400" alt="HeyCyan Smart Glasses" />
+</p>
+
 Real-time AI vision and voice assistant through HeyCyan Smart Glasses, powered by [Pepebot](https://github.com/pepebot-space/pepebot) Live API.
 
-Nisaetus connects to HeyCyan smart glasses via BLE, captures photos from the glasses camera over WiFi, streams microphone audio to the Pepebot Live API, and plays back AI responses — enabling hands-free AI interaction through smart glasses.
+Nisaetus connects to HeyCyan smart glasses via BLE, streams microphone audio directly from the glasses (OPUS via BLE), captures AI photo thumbnails from the glasses camera (JPEG via BLE), and plays back AI responses through the local speaker — enabling fully wireless, hands-free AI interaction through smart glasses.
 
 ## How It Works
 
 ```
-┌─────────────────┐     BLE      ┌──────────────┐    WebSocket    ┌─────────────┐
-│  HeyCyan Glasses │◄────────────►│   Nisaetus   │◄──────────────►│   Pepebot   │
-│                  │   WiFi/HTTP  │   (Python)   │                │  Live API   │
-│  - Camera        │◄────────────►│              │                │  (Gemini)   │
-│  - Microphone    │              │  - BLE ctrl  │                └─────────────┘
-│  - Speaker       │              │  - WiFi xfer │
-└─────────────────┘              │  - Audio I/O │
-                                  └──────────────┘
+┌──────────────────────┐         BLE          ┌──────────────┐   WebSocket   ┌─────────────┐
+│   HeyCyan Glasses    │◄────────────────────►│   Nisaetus   │◄─────────────►│   Pepebot   │
+│                      │                       │   (Python)   │               │  Live API   │
+│  📷 Camera           │──── JPEG thumbnail ──►│              │               │  (Gemini)   │
+│  🎤 Mic (OPUS BLE)   │──── audio stream ────►│              │               └─────────────┘
+│  🔊 Speaker          │                       │              │
+│                      │◄─── commands ─────────│              │
+└──────────────────────┘                       └──────────────┘
 ```
 
-1. **BLE** — Connect to glasses, send commands (photo/video/audio/speaker control)
-2. **WiFi Transfer** — Glasses creates a hotspot, Nisaetus downloads captured photos via HTTP
-3. **Pepebot Live API** — JPEG frames + PCM audio streamed over WebSocket to Gemini for real-time multimodal AI
-4. **Audio Playback** — AI audio responses played back locally
+1. **Mic** — Glasses streams OPUS audio via BLE (`cmd=0x59`), decoded to PCM 16kHz and sent to Pepebot
+2. **Camera** — AI photo thumbnail captured on glasses, sent as JPEG via BLE (`cmd=0xFD`), forwarded to Pepebot as video frames
+3. **Pepebot Live API** — PCM audio + JPEG frames streamed over WebSocket to Gemini Live for real-time multimodal AI
+4. **Speaker** — AI audio responses (PCM 24kHz) played back through local speaker
+
+## Device Compatibility
+
+Tested on **HeyCyan M02S / A02S** (`M02S_D1BA`):
+
+| Feature | Status |
+|---------|--------|
+| BLE scan & connect | Working |
+| Battery query | Working |
+| Take photo | Working |
+| Find device (beep) | Working |
+| AI photo + thumbnail via BLE | Working |
+| Mic audio stream (OPUS BLE) | Working |
+| WiFi transfer | Not supported on macOS (WiFi Direct / P2P) |
 
 ## Requirements
 
@@ -42,16 +60,16 @@ poetry install
 ## Usage
 
 ```bash
-# Default: connect to glasses via BLE, use glasses camera + local mic
+# Default: glasses mic (OPUS BLE) + AI photo thumbnails + local speaker
 poetry run nisaetus
 
-# Skip BLE scan, connect directly by address
+# Connect directly by BLE address (skip scan)
 poetry run nisaetus --address AA:BB:CC:DD:EE:FF
 
-# Local mode (no glasses, local mic only)
+# Local mic only (no glasses)
 poetry run nisaetus --mode local
 
-# Hybrid mode (glasses camera + local mic + local speaker)
+# Hybrid: glasses camera thumbnails + local mic
 poetry run nisaetus --mode hybrid
 
 # Custom Pepebot URL
@@ -65,80 +83,76 @@ poetry run nisaetus -v
 
 | Mode | Camera | Microphone | Speaker |
 |------|--------|------------|---------|
-| `glasses` | Glasses (WiFi) | Local mic | Local speaker |
-| `hybrid` | Glasses (WiFi) | Local mic | Local speaker |
+| `glasses` | Glasses (JPEG via BLE) | Glasses mic (OPUS via BLE) | Local speaker |
+| `hybrid` | Glasses (JPEG via BLE) | Local mic | Local speaker |
 | `local` | None | Local mic | Local speaker |
 
-### Glasses WiFi Connection
-
-When running in `glasses` or `hybrid` mode, after BLE connection the glasses will start a WiFi hotspot. Connect your computer to it:
-
-- **Password:** `123456789`
-- Nisaetus will auto-detect the glasses IP (tries `192.168.43.1`, `192.168.4.1`, etc.)
+> **Note:** In `glasses` mode, camera (AI photo) and mic (speech recognition) cannot run simultaneously — they are separate glasses modes. The mic stream takes priority.
 
 ## Project Structure
 
 ```
 nisaetus/
 ├── __init__.py
-├── protocol.py         # BLE protocol (packet framing, CRC16, command IDs)
-├── glasses.py          # HeyCyan BLE client (scan, connect, commands)
-├── wifi_transfer.py    # HTTP media download from glasses hotspot
+├── protocol.py         # BLE protocol: packet framing, CRC16, command IDs, enums
+├── glasses.py          # HeyCyan BLE client: scan, connect, commands, audio/thumbnail streaming
+├── wifi_transfer.py    # HTTP media download from glasses hotspot (Android/WiFi Direct only)
 ├── live_client.py      # Pepebot Live API WebSocket integration
 └── cli.py              # CLI entry point
+assets/
+└── glass.png           # Device image
 scripts/
 └── test_glasses.py     # Standalone test script for glasses commands
+ARCHITECTURE.md         # Full protocol documentation & debugging guide
 ```
 
 ## BLE Protocol
 
-Reverse-engineered from the [HeyCyan Smart Glasses SDK](https://github.com/anak10thn/HeyCyanSmartGlassesSDK) (oudmon BLE library).
+Reverse-engineered by decompiling the Android `glasses_sdk_20250723_v01.aar` (oudmon BLE library). See [ARCHITECTURE.md](ARCHITECTURE.md) for full details.
 
-### Channels
+### Active Channels
 
-| Channel | Service UUID | Write Char | Notify Char | Purpose |
-|---------|---|---|---|---|
-| Serial Port | `de5bf728-d711-4e47-af26-65e3012a5dc7` | `de5bf72a` | `de5bf729` | Main command protocol (camera, battery, AI) |
-| Small Data | `6e40fff0-b5a3-f393-e0a9-e50e24dcca9e` | `6e400002` | `6e400003` | 16-byte fixed packets |
+| Channel | Service | Write | Notify | Purpose |
+|---------|---------|-------|--------|---------|
+| Serial Port | `de5bf728-...` | `de5bf72a` | `de5bf729` | All commands, responses, audio, thumbnails |
+| Small Data | `6e40fff0-...` | `6e400002` | `6e400003` | 16-byte fixed packets (unused) |
 
-### Packet Format (Serial Port)
+> The `ae01/ae02` channel (oudmon UART) echoes all data without processing — not used.
 
-All commands use the serial port channel with this framing:
+### Packet Format
 
 ```
 [0xBC] [cmd_id] [len_lo] [len_hi] [crc16_lo] [crc16_hi] [payload...]
 ```
 
-- Magic byte: `0xBC`
-- CRC16/MODBUS computed over payload
-- Packets > 244 bytes are fragmented into chunks
+CRC16/MODBUS over payload. Packets > 244 bytes are fragmented.
 
-### Command IDs
-
-| ID | Hex | Purpose |
-|----|-----|---------|
-| 64 | `0x40` | Sync time |
-| 65 | `0x41` | Glasses control (photo/video/audio/transfer) |
-| 66 | `0x42` | Battery query |
-| 67 | `0x43` | Device info |
-| 68 | `0x44` | AI voice |
-| 72 | `0x48` | Voice status |
-| 81 | `0x51` | Volume control |
-
-### Glasses Control Payloads (cmd 0x41)
+### Key Commands (cmd 0x41 — Glasses Control)
 
 | Command | Payload | Description |
 |---------|---------|-------------|
 | Take photo | `02 01 01` | Capture photo |
 | Start video | `02 01 02` | Start recording |
-| Stop video | `02 01 03` | Stop recording |
-| WiFi transfer | `02 01 04` | Enable WiFi hotspot |
-| AI photo | `02 01 06 sz sz 02` | AI capture + thumbnail |
-| Start audio | `02 01 08` | Record audio (mic) |
-| Stop audio | `02 01 0C` | Stop audio recording |
+| AI photo | `02 01 06 02 02 02` | AI capture + thumbnail |
+| Speech recognition | `02 01 07` | Start mic stream (OPUS via BLE) |
 | Find device | `02 01 0D` | Beep/flash |
 | Speaker start | `02 01 10` | Start voice playback |
-| Speaker stop | `02 01 11` | Stop voice playback |
+| WiFi transfer | `02 01 04` | Enable WiFi P2P hotspot |
+
+### Mic Audio Stream (cmd 0x59)
+
+When speech recognition mode is active, the glasses stream OPUS audio:
+
+- **40 bytes/packet**, ~48 packets/second
+- **Codec:** OPUS, 16kHz mono, ~20ms frames
+- **Decode:** `opuslib.Decoder(16000, 1).decode(frame, 320)`
+- Glasses auto-stop after ~5s silence; Nisaetus auto-restarts
+
+### AI Photo Thumbnail (cmd 0xFD)
+
+```
+take_ai_photo()  →  wait cmd=0x73 (photo ready)  →  request cmd=0xFD  →  receive JPEG ~1KB
+```
 
 ## License
 
