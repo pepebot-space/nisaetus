@@ -11,6 +11,7 @@ bleak = "^0.21.0"
 websockets = "^13.0"
 pyaudio = "^0.2.14"
 aiohttp = "^3.9.0"
+opuslib = "^3.0.1"
 
 [tool.poetry.scripts]
 nisaetus = "nisaetus.cli:main_entry"

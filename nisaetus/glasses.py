@@ -79,6 +79,8 @@ class HeyCyanGlasses:
         # Thumbnail received via BLE (JPEG bytes)
         self._thumbnail_event = asyncio.Event()
         self._thumbnail_data: Optional[bytes] = None
+        # Audio stream from glasses mic (OPUS frames via cmd 0x59)
+        self._audio_callback: Optional[Callable[[bytes], None]] = None
 
     # ── Event System ────────────────────────────────────────────────────
 
@@ -308,6 +310,16 @@ class HeyCyanGlasses:
                 logger.info("Received thumbnail raw (%d bytes)", len(payload))
             self._thumbnail_event.set()
 
+        # Audio stream from mic (cmd 0x59 = GPT_UPLOAD)
+        if cmd_id == CmdId.GPT_UPLOAD and payload and self._audio_callback:
+            # Strip trailing zeros from 40-byte packet
+            end = len(payload)
+            while end > 0 and payload[end - 1] == 0:
+                end -= 1
+            if end > 0:
+                self._audio_callback(bytes(payload[:end]))
+            self._last_audio_time = asyncio.get_event_loop().time()
+
         # Signal data reporting event (cmd 0x73) for thumbnail flow
         if cmd_id == CmdId.DATA_REPORTING:
             if hasattr(self, '_data_report_event'):
@@ -432,6 +444,23 @@ class HeyCyanGlasses:
         except asyncio.TimeoutError:
             logger.warning("AI photo thumbnail timeout")
             return None
+
+    def on_audio(self, callback: Optional[Callable[[bytes], None]]):
+        """Set callback for raw OPUS frames from glasses mic.
+
+        callback receives raw OPUS frame bytes (no header, no zero padding).
+        Decode with opuslib.Decoder(16000, 1), frame_size=320.
+        Set to None to stop receiving.
+        """
+        self._audio_callback = callback
+
+    async def start_mic_stream(self):
+        """Start speech recognition mode to stream mic audio via BLE."""
+        await self.start_speech_recognition()
+
+    async def stop_mic_stream(self):
+        """Stop mic audio streaming."""
+        await self.stop_speech_recognition()
 
     async def sync_time(self):
         """Sync device time."""

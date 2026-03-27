@@ -591,6 +591,17 @@ files = [
 ]
 
 [[package]]
+name = "opuslib"
+version = "3.0.1"
+description = "Python bindings to the libopus, IETF low-delay audio codec"
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "opuslib-3.0.1.tar.gz", hash = "sha256:2cb045e5b03e7fc50dfefe431e3404dddddbd8f5961c10c51e32dfb69a044c97"},
+]
+
+[[package]]
 name = "propcache"
 version = "0.4.1"
 description = "Accelerated property cache"
@@ -1318,4 +1329,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.13"
-content-hash = "72ea144859c28653f061f1a30be000e2a62d7a218c2e5575b3702ba11ee75e2e"
+content-hash = "e0aa054616e6e70abdec1c91075f605ad83d0f0f8909692f678a51cf47bf7652"

@@ -3,11 +3,11 @@ Pepebot Live API client integrated with HeyCyan Smart Glasses.
 
 Flow:
 1. Connect to glasses via BLE
-2. Enable WiFi transfer → glasses becomes hotspot
-3. Capture photos from glasses camera, send as video frames to Live API
-4. Stream local mic audio to Live API (glasses mic stores OPUS files)
-5. Play AI audio responses through glasses speaker via AI Speak mode
-6. Receive AI text/audio from websocket
+2. Start speech recognition → glasses stream OPUS audio from mic via BLE
+3. Decode OPUS → PCM 16kHz → send to Pepebot Live API
+4. Capture AI photo thumbnails from glasses camera via BLE
+5. Receive AI audio/text responses from websocket
+6. Play AI audio through local speaker
 """
 
 import asyncio
@@ -21,6 +21,7 @@ from typing import Optional
 import audioop
 import pyaudio
 import websockets
+import opuslib
 
 from .glasses import HeyCyanGlasses
 from .protocol import AISpeakMode, DeviceMode
@@ -254,10 +255,99 @@ class NisaetusLive:
                 except Exception:
                     pass
 
-        async def sender_audio(ws):
-            """Stream local mic audio to pepebot."""
+        async def sender_audio_glasses(ws):
+            """Stream glasses mic audio (OPUS via BLE) to pepebot as PCM."""
+            if not self.glasses.connected:
+                logger.info("Glasses not connected, glasses mic disabled")
+                return
+
+            opus_decoder = opuslib.Decoder(INPUT_RATE, CHANNELS)
+            audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=512)
+
+            def on_opus_frame(frame: bytes):
+                """Called from BLE notification thread with raw OPUS frame."""
+                try:
+                    pcm = opus_decoder.decode(frame, INPUT_RATE // 50)  # 20ms = 320 samples
+                    audio_queue.put_nowait(pcm)
+                except Exception:
+                    pass
+
+            self.glasses.on_audio(on_opus_frame)
+            self.glasses._last_audio_time = loop.time()
+            await self.glasses.start_mic_stream()
+            logger.info("Glasses mic streaming active (OPUS → PCM 16kHz)")
+
+            # Batch PCM chunks before sending
+            BATCH_SIZE = INPUT_CHUNK * SAMPLE_WIDTH  # 4096 bytes
+            MIC_RESTART_TIMEOUT = 3.0  # restart speech recognition if no audio for 3s
+
+            try:
+                pcm_buffer = bytearray()
+                while not self.stop_event.is_set():
+                    # Auto-restart speech recognition if glasses stopped sending audio
+                    if loop.time() - self.glasses._last_audio_time > MIC_RESTART_TIMEOUT:
+                        if self.glasses.connected:
+                            logger.info("Restarting glasses mic (silence timeout)...")
+                            try:
+                                await self.glasses.stop_mic_stream()
+                                await asyncio.sleep(0.3)
+                                await self.glasses.start_mic_stream()
+                                self.glasses._last_audio_time = loop.time()
+                            except Exception:
+                                pass
+
+                    try:
+                        pcm = await asyncio.wait_for(audio_queue.get(), timeout=0.2)
+                        pcm_buffer.extend(pcm)
+
+                        if len(pcm_buffer) >= BATCH_SIZE:
+                            chunk = bytes(pcm_buffer[:BATCH_SIZE])
+                            del pcm_buffer[:BATCH_SIZE]
+
+                            if ENABLE_NOISE_GATE:
+                                chunk = noise_gate.process(chunk)
+                            b64 = base64.b64encode(chunk).decode("utf-8")
+                            await ws.send(json.dumps({
+                                "realtimeInput": {
+                                    "mediaChunks": [{
+                                        "mimeType": f"audio/pcm;rate={INPUT_RATE}",
+                                        "data": b64,
+                                    }]
+                                }
+                            }))
+                    except asyncio.TimeoutError:
+                        if pcm_buffer:
+                            chunk = bytes(pcm_buffer)
+                            pcm_buffer.clear()
+                            if ENABLE_NOISE_GATE:
+                                chunk = noise_gate.process(chunk)
+                            b64 = base64.b64encode(chunk).decode("utf-8")
+                            await ws.send(json.dumps({
+                                "realtimeInput": {
+                                    "mediaChunks": [{
+                                        "mimeType": f"audio/pcm;rate={INPUT_RATE}",
+                                        "data": b64,
+                                    }]
+                                }
+                            }))
+                        continue
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as e:
+                        if not self.stop_event.is_set():
+                            logger.error("Glasses audio sender error: %s", e)
+                        return
+            finally:
+                self.glasses.on_audio(None)
+                try:
+                    await self.glasses.stop_mic_stream()
+                except Exception:
+                    pass
+
+        async def sender_audio_local(ws):
+            """Stream local mic audio to pepebot (fallback)."""
             if not stream_in:
-                logger.info("No mic, audio sender disabled")
+                logger.info("No local mic, audio sender disabled")
                 return
             while not self.stop_event.is_set():
                 try:
@@ -272,7 +362,7 @@ class NisaetusLive:
                     await ws.send(json.dumps({
                         "realtimeInput": {
                             "mediaChunks": [{
-                                "mimeType": "audio/pcm;rate=16000",
+                                "mimeType": f"audio/pcm;rate={INPUT_RATE}",
                                 "data": b64,
                             }]
                         }
@@ -403,23 +493,45 @@ class NisaetusLive:
                 if not setup_ok:
                     return
 
+                # Select audio source based on mode
+                use_glasses_mic = self.mode == "glasses" and self.glasses.connected
+
                 mode_label = {
-                    "glasses": "Glasses camera (BLE) + Local mic + Local speaker",
-                    "hybrid": "Glasses camera (BLE) + Local mic + Local speaker",
+                    "glasses": "Glasses mic (BLE OPUS) + Glasses camera + Local speaker",
+                    "hybrid": "Local mic + Glasses camera + Local speaker",
                     "local": "Local mic + Local speaker (no glasses)",
                 }
                 print(f"\nMode: {mode_label.get(self.mode, self.mode)}")
-                print(f"Mic: {INPUT_RATE}Hz | Speaker: {OUTPUT_RATE}Hz")
+                print(f"Audio: {INPUT_RATE}Hz | Speaker: {OUTPUT_RATE}Hz")
                 if self.glasses.connected:
                     print(f"Glasses: connected (battery {self.glasses.battery_level}%)")
+                if use_glasses_mic:
+                    print(f"Mic: glasses (OPUS via BLE)")
+                elif stream_in:
+                    print(f"Mic: local")
+                else:
+                    print(f"Mic: NONE")
                 if self.glasses.connected and video_enabled:
                     print(f"Camera: AI photo thumbnails via BLE (every {VIDEO_INTERVAL_SEC}s)")
                 print("Speak now... Press Ctrl+C to stop.\n")
 
+                # Choose audio sender
+                # NOTE: glasses can only do one mode at a time.
+                # When using glasses mic (speech recognition mode), video capture is disabled
+                # because AI photo mode conflicts with speech recognition mode.
+                if use_glasses_mic:
+                    audio_task = asyncio.create_task(sender_audio_glasses(ws))
+                    video_task = asyncio.create_task(asyncio.sleep(0))  # no-op
+                    if video_enabled:
+                        print("NOTE: Video disabled while using glasses mic (mode conflict)")
+                else:
+                    audio_task = asyncio.create_task(sender_audio_local(ws))
+                    video_task = asyncio.create_task(sender_video(ws, video_enabled))
+
                 tasks = [
                     asyncio.create_task(playback_worker()),
-                    asyncio.create_task(sender_audio(ws)),
-                    asyncio.create_task(sender_video(ws, video_enabled)),
+                    audio_task,
+                    video_task,
                     asyncio.create_task(receiver(ws)),
                 ]
 
