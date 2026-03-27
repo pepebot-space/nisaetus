@@ -74,6 +74,11 @@ class HeyCyanGlasses:
         self.battery_level = -1
         self.is_charging = False
         self.connected = False
+        self.wifi_ssid: Optional[str] = None
+        self.wifi_password: Optional[str] = None
+        # Thumbnail received via BLE (JPEG bytes)
+        self._thumbnail_event = asyncio.Event()
+        self._thumbnail_data: Optional[bytes] = None
 
     # ── Event System ────────────────────────────────────────────────────
 
@@ -269,12 +274,44 @@ class HeyCyanGlasses:
             data_type = payload[1] if len(payload) > 1 else 0
             logger.info("GlassesControl response: dataType=%d", data_type)
 
+            # WiFi transfer response: payload contains SSID + password
+            # Format: 02 01 04 01 [ssid_len_le16] [pass_len_le16] [ssid_bytes] [pass_bytes]
+            if len(payload) >= 8 and payload[2] == DeviceMode.TRANSFER:
+                try:
+                    ssid_len = payload[4] | (payload[5] << 8)
+                    pass_len = payload[6] | (payload[7] << 8)
+                    offset = 8
+                    if len(payload) >= offset + ssid_len + pass_len:
+                        self.wifi_ssid = payload[offset:offset + ssid_len].decode("utf-8", errors="replace")
+                        self.wifi_password = payload[offset + ssid_len:offset + ssid_len + pass_len].decode("utf-8", errors="replace")
+                        logger.info("WiFi SSID: %s  Password: %s", self.wifi_ssid, self.wifi_password)
+                except Exception as e:
+                    logger.debug("Failed to parse WiFi info: %s", e)
+
         # Parse battery response (cmd 0x42)
         if cmd_id == CmdId.BATTERY and len(payload) >= 2:
             self.battery_level = payload[0]
             self.is_charging = bool(payload[1]) if len(payload) > 1 else False
             logger.info("Battery: %d%% %s", self.battery_level,
                         "(charging)" if self.is_charging else "")
+
+        # Parse thumbnail response (cmd 0xFD)
+        # Payload format: [header bytes...] [FFD8...JPEG data]
+        if cmd_id == CmdId.PICTURE_THUMBNAILS and payload:
+            # Find JPEG start marker (FF D8)
+            jpeg_start = payload.find(b'\xff\xd8')
+            if jpeg_start >= 0:
+                self._thumbnail_data = bytes(payload[jpeg_start:])
+                logger.info("Received thumbnail JPEG (%d bytes)", len(self._thumbnail_data))
+            else:
+                self._thumbnail_data = bytes(payload)
+                logger.info("Received thumbnail raw (%d bytes)", len(payload))
+            self._thumbnail_event.set()
+
+        # Signal data reporting event (cmd 0x73) for thumbnail flow
+        if cmd_id == CmdId.DATA_REPORTING:
+            if hasattr(self, '_data_report_event'):
+                self._data_report_event.set()
 
         # Parse device notify events from payload
         if len(payload) > 6:
@@ -353,6 +390,48 @@ class HeyCyanGlasses:
 
     async def disable_wifi_transfer(self):
         await self._glasses_control(bytes([0x02, 0x01, DeviceMode.TRANSFER_STOP]))
+
+    async def get_thumbnail(self, timeout: float = 10.0) -> Optional[bytes]:
+        """Get the latest photo thumbnail via BLE (JPEG bytes).
+
+        Call take_ai_photo() first, then this to receive the thumbnail.
+        """
+        self._thumbnail_event.clear()
+        await self.send_command(CmdId.PICTURE_THUMBNAILS, b"")
+        try:
+            await asyncio.wait_for(self._thumbnail_event.wait(), timeout)
+            return self._thumbnail_data
+        except asyncio.TimeoutError:
+            logger.warning("Thumbnail response timeout")
+            return None
+
+    async def capture_and_get_thumbnail(self, thumbnail_size: int = 0x02,
+                                         timeout: float = 15.0) -> Optional[bytes]:
+        """Take an AI photo and get the thumbnail via BLE.
+
+        Flow: take_ai_photo → wait for data reporting (0x73) → request thumbnail (0xFD).
+        Returns JPEG bytes of the thumbnail, or None on timeout.
+        """
+        self._thumbnail_event.clear()
+        self._data_report_event = asyncio.Event()
+        await self.take_ai_photo(thumbnail_size)
+
+        # Wait for data reporting (cmd=0x73) which signals photo is ready
+        try:
+            await asyncio.wait_for(self._data_report_event.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+        # Extra settle time
+        await asyncio.sleep(0.5)
+
+        # Request thumbnail
+        await self.send_command(CmdId.PICTURE_THUMBNAILS, b"")
+        try:
+            await asyncio.wait_for(self._thumbnail_event.wait(), timeout)
+            return self._thumbnail_data
+        except asyncio.TimeoutError:
+            logger.warning("AI photo thumbnail timeout")
+            return None
 
     async def sync_time(self):
         """Sync device time."""

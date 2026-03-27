@@ -15,6 +15,23 @@ from .protocol import WIFI_CANDIDATE_IPS, MEDIA_CONFIG_PATH, MEDIA_FILES_PATH
 
 logger = logging.getLogger(__name__)
 
+MEDIA_EXTENSIONS = (".jpg", ".jpeg", ".png", ".heic", ".mov", ".mp4", ".m4v", ".opus", ".wav")
+
+
+def _is_valid_media_config(text: str) -> bool:
+    """Check if response is a real media.config (file list), not an HTML page."""
+    stripped = text.strip()
+    if not stripped:
+        return True  # empty is valid (no files)
+    if stripped.startswith("<!") or stripped.startswith("<html") or "<head>" in stripped.lower():
+        return False
+    # At least one line should look like a media filename
+    for line in stripped.split("\n"):
+        line = line.strip()
+        if line and any(line.lower().endswith(ext) for ext in MEDIA_EXTENSIONS):
+            return True
+    return False
+
 
 async def find_glasses_ip(timeout: float = 3.0) -> Optional[str]:
     """Probe candidate IPs to find the glasses HTTP server."""
@@ -24,8 +41,12 @@ async def find_glasses_ip(timeout: float = 3.0) -> Optional[str]:
             try:
                 async with session.get(url) as resp:
                     if resp.status == 200:
-                        logger.info("Glasses found at %s", ip)
-                        return ip
+                        text = await resp.text()
+                        if _is_valid_media_config(text):
+                            logger.info("Glasses found at %s", ip)
+                            return ip
+                        else:
+                            logger.debug("Skipping %s (responded with HTML)", ip)
             except Exception:
                 continue
     return None
@@ -37,7 +58,8 @@ async def list_media(ip: str) -> list[str]:
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             text = await resp.text()
-            files = [f.strip() for f in text.strip().split("\n") if f.strip()]
+            files = [f.strip() for f in text.strip().split("\n")
+                     if f.strip() and not f.strip().startswith("<")]
             logger.info("Found %d media files", len(files))
             return files
 
@@ -46,14 +68,16 @@ async def download_file(ip: str, filename: str, dest_dir: str = "./media") -> Pa
     """Download a single media file from glasses."""
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
-    filepath = dest / filename
+    # Sanitize filename
+    safe_name = Path(filename).name
+    filepath = dest / safe_name
 
     url = f"http://{ip}{MEDIA_FILES_PATH}{filename}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             data = await resp.read()
             filepath.write_bytes(data)
-            logger.info("Downloaded %s (%d bytes)", filename, len(data))
+            logger.info("Downloaded %s (%d bytes)", safe_name, len(data))
             return filepath
 
 

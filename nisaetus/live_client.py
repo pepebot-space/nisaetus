@@ -21,11 +21,9 @@ from typing import Optional
 import audioop
 import pyaudio
 import websockets
-import aiohttp
 
 from .glasses import HeyCyanGlasses
 from .protocol import AISpeakMode, DeviceMode
-from .wifi_transfer import find_glasses_ip, MEDIA_FILES_PATH, MEDIA_CONFIG_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +130,6 @@ class NisaetusLive:
         self.url = url
         self.mode = mode
         self.glasses = HeyCyanGlasses()
-        self.glasses_ip: Optional[str] = None
         self.stop_event = asyncio.Event()
 
     async def run(self, glasses_address: Optional[str] = None):
@@ -160,7 +157,7 @@ class NisaetusLive:
             await self.glasses.disconnect()
 
     async def _connect_glasses(self, address: Optional[str] = None):
-        """Scan, connect, and optionally enable WiFi for camera access."""
+        """Scan, connect to glasses via BLE."""
         if address:
             await self.glasses.connect(address)
         else:
@@ -182,25 +179,6 @@ class NisaetusLive:
         await self.glasses.sync_time()
         logger.info("Glasses battery: %d%%", self.glasses.battery_level)
 
-        # Enable WiFi transfer for camera access
-        logger.info("Enabling WiFi transfer for camera access...")
-        await self.glasses.enable_wifi_transfer()
-        print("Connect to the glasses WiFi hotspot (password: 123456789)")
-        print("Waiting for WiFi connection...")
-
-        # Wait for user to connect to glasses WiFi
-        for attempt in range(30):
-            if self.stop_event.is_set():
-                return
-            self.glasses_ip = await find_glasses_ip(timeout=2.0)
-            if self.glasses_ip:
-                logger.info("Glasses WiFi connected at %s", self.glasses_ip)
-                break
-            await asyncio.sleep(2.0)
-        else:
-            logger.warning("Could not find glasses on WiFi, camera disabled")
-            self.glasses_ip = None
-
     async def _run_live_session(self, loop):
         """WebSocket session with pepebot."""
         p = pyaudio.PyAudio()
@@ -208,10 +186,20 @@ class NisaetusLive:
         bot_speaking_until = 0.0
         noise_gate = NoiseGate()
 
-        stream_out = p.open(format=FORMAT, channels=CHANNELS, rate=OUTPUT_RATE,
-                            output=True, frames_per_buffer=OUTPUT_CHUNK)
-        stream_in = p.open(format=FORMAT, channels=CHANNELS, rate=INPUT_RATE,
-                           input=True, frames_per_buffer=INPUT_CHUNK)
+        stream_out = None
+        stream_in = None
+        try:
+            stream_out = p.open(format=FORMAT, channels=CHANNELS, rate=OUTPUT_RATE,
+                                output=True, frames_per_buffer=OUTPUT_CHUNK)
+        except OSError as e:
+            logger.warning("Cannot open audio output: %s", e)
+
+        try:
+            stream_in = p.open(format=FORMAT, channels=CHANNELS, rate=INPUT_RATE,
+                               input=True, frames_per_buffer=INPUT_CHUNK)
+        except OSError as e:
+            logger.warning("Cannot open audio input: %s (check microphone permission)", e)
+            print("WARNING: No microphone available. Grant mic permission or check audio devices.")
 
         async def enqueue_audio(pcm: bytes):
             nonlocal bot_speaking_until
@@ -225,6 +213,9 @@ class NisaetusLive:
 
         async def playback_worker():
             """Play AI audio responses through local speaker."""
+            if not stream_out:
+                logger.info("No speaker, playback disabled")
+                return
             bytes_per_chunk = OUTPUT_CHUNK * SAMPLE_WIDTH
             prebuffer_target = OUTPUT_PREBUFFER_CHUNKS * bytes_per_chunk
             pending = bytearray()
@@ -265,6 +256,9 @@ class NisaetusLive:
 
         async def sender_audio(ws):
             """Stream local mic audio to pepebot."""
+            if not stream_in:
+                logger.info("No mic, audio sender disabled")
+                return
             while not self.stop_event.is_set():
                 try:
                     if not ENABLE_BARGE_IN and loop.time() < bot_speaking_until:
@@ -292,63 +286,42 @@ class NisaetusLive:
                     return
 
         async def sender_video(ws, video_enabled: bool):
-            """Capture frames from glasses camera via WiFi and send to pepebot."""
+            """Capture AI photo thumbnails from glasses via BLE and send to pepebot."""
             if not video_enabled:
                 return
-            if not self.glasses_ip:
-                logger.info("No glasses WiFi, video sender disabled")
+            if not self.glasses.connected:
+                logger.info("Glasses not connected, video sender disabled")
                 return
 
-            logger.info("Glasses camera sender active (JPEG via WiFi)")
-            async with aiohttp.ClientSession() as session:
-                while not self.stop_event.is_set():
-                    try:
-                        # Trigger photo capture on glasses
-                        if self.glasses.connected:
-                            await self.glasses.take_photo()
-                            await asyncio.sleep(1.5)  # wait for photo to be saved
+            logger.info("Glasses camera sender active (AI photo thumbnails via BLE)")
+            while not self.stop_event.is_set():
+                try:
+                    # Capture AI photo and get thumbnail via BLE
+                    jpeg_data = await self.glasses.capture_and_get_thumbnail(
+                        thumbnail_size=0x02, timeout=8.0
+                    )
+                    if not jpeg_data:
+                        await asyncio.sleep(VIDEO_INTERVAL_SEC)
+                        continue
 
-                        # Get latest photo from glasses
-                        config_url = f"http://{self.glasses_ip}{MEDIA_CONFIG_PATH}"
-                        async with session.get(config_url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
-                            if resp.status != 200:
-                                await asyncio.sleep(VIDEO_INTERVAL_SEC)
-                                continue
-                            text = await resp.text()
-                            files = [f.strip() for f in text.strip().split("\n") if f.strip()]
+                    b64 = base64.b64encode(jpeg_data).decode("utf-8")
+                    await ws.send(json.dumps({
+                        "realtimeInput": {
+                            "mediaChunks": [{
+                                "mimeType": VIDEO_MIME,
+                                "data": b64,
+                            }]
+                        }
+                    }))
+                    logger.debug("Sent glasses thumbnail (%d bytes)", len(jpeg_data))
 
-                        photo_exts = (".jpg", ".jpeg", ".png")
-                        photos = [f for f in files if any(f.lower().endswith(e) for e in photo_exts)]
-                        if not photos:
-                            await asyncio.sleep(VIDEO_INTERVAL_SEC)
-                            continue
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    if not self.stop_event.is_set():
+                        logger.debug("Video sender: %s", e)
 
-                        latest = photos[-1]
-                        file_url = f"http://{self.glasses_ip}{MEDIA_FILES_PATH}{latest}"
-                        async with session.get(file_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                            if resp.status != 200:
-                                await asyncio.sleep(VIDEO_INTERVAL_SEC)
-                                continue
-                            jpeg_data = await resp.read()
-
-                        b64 = base64.b64encode(jpeg_data).decode("utf-8")
-                        await ws.send(json.dumps({
-                            "realtimeInput": {
-                                "mediaChunks": [{
-                                    "mimeType": VIDEO_MIME,
-                                    "data": b64,
-                                }]
-                            }
-                        }))
-                        logger.debug("Sent glasses frame (%d bytes)", len(jpeg_data))
-
-                    except asyncio.CancelledError:
-                        return
-                    except Exception as e:
-                        if not self.stop_event.is_set():
-                            logger.debug("Video sender: %s", e)
-
-                    await asyncio.sleep(VIDEO_INTERVAL_SEC)
+                await asyncio.sleep(VIDEO_INTERVAL_SEC)
 
         async def receiver(ws):
             """Receive AI responses from pepebot."""
@@ -431,16 +404,16 @@ class NisaetusLive:
                     return
 
                 mode_label = {
-                    "glasses": "Glasses camera + Local mic + Local speaker",
-                    "hybrid": "Glasses camera + Local mic + Local speaker",
+                    "glasses": "Glasses camera (BLE) + Local mic + Local speaker",
+                    "hybrid": "Glasses camera (BLE) + Local mic + Local speaker",
                     "local": "Local mic + Local speaker (no glasses)",
                 }
                 print(f"\nMode: {mode_label.get(self.mode, self.mode)}")
                 print(f"Mic: {INPUT_RATE}Hz | Speaker: {OUTPUT_RATE}Hz")
                 if self.glasses.connected:
                     print(f"Glasses: connected (battery {self.glasses.battery_level}%)")
-                if self.glasses_ip and video_enabled:
-                    print(f"Camera: glasses @ {self.glasses_ip} (every {VIDEO_INTERVAL_SEC}s)")
+                if self.glasses.connected and video_enabled:
+                    print(f"Camera: AI photo thumbnails via BLE (every {VIDEO_INTERVAL_SEC}s)")
                 print("Speak now... Press Ctrl+C to stop.\n")
 
                 tasks = [
@@ -464,21 +437,17 @@ class NisaetusLive:
         except asyncio.TimeoutError:
             print("Timeout waiting for setupComplete")
         finally:
-            try:
-                stream_in.stop_stream()
-                stream_in.close()
-            except Exception:
-                pass
-            try:
-                stream_out.stop_stream()
-                stream_out.close()
-            except Exception:
-                pass
-            p.terminate()
-
-            # Disable glasses WiFi transfer on exit
-            if self.glasses.connected:
+            if stream_in:
                 try:
-                    await self.glasses.disable_wifi_transfer()
+                    stream_in.stop_stream()
+                    stream_in.close()
                 except Exception:
                     pass
+            if stream_out:
+                try:
+                    stream_out.stop_stream()
+                    stream_out.close()
+                except Exception:
+                    pass
+            p.terminate()
+
