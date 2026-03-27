@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "nisaetus"
+version = "0.1.0"
+description = "HeyCyan Smart Glasses + Pepebot Live API - Real-time AI vision and voice through BLE glasses"
+authors = ["anak10thn"]
+packages = [{include = "nisaetus"}]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+bleak = "^0.21.0"
+websockets = "^13.0"
+pyaudio = "^0.2.14"
+aiohttp = "^3.9.0"
+
+[tool.poetry.scripts]
+nisaetus = "nisaetus.cli:main_entry"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
